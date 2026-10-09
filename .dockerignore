@@ -1,0 +1,9 @@
+.git
+.env
+.env.*
+*.test
+coverage.out
+README.md
+dist/
+assets/
+.DS_Store

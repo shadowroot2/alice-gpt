@@ -1,0 +1,46 @@
+services:
+  app:
+    image: dmtrigub/alice-gpt:ds425plus
+    platform: linux/amd64
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      LISTEN_ADDR: :8080
+    ports:
+      - "${BIND_ADDRESS:-0.0.0.0}:${HTTP_PORT:-48132}:8080"
+    depends_on: [redis]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 192m
+    stop_grace_period: 10s
+    healthcheck:
+      test: [CMD, /usr/local/bin/server, healthcheck]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+  redis:
+    image: redis:8.10.2-alpine3.23
+    restart: unless-stopped
+    command: [redis-server, --appendonly, "yes", --appendfsync, everysec, --maxmemory, 128mb, --maxmemory-policy, noeviction]
+    volumes:
+      - redis-data:/data
+    networks: [default]
+    cap_drop: [ALL]
+    cap_add: [SETUID, SETGID, CHOWN]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+volumes:
+  redis-data:

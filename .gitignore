@@ -1,0 +1,8 @@
+.env
+.env.*
+!.env.example
+/server
+*.test
+coverage.out
+.DS_Store
+dist/
