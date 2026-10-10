@@ -20,8 +20,10 @@ type Conversation struct {
 
 type Pending struct {
 	StartedAt time.Time `json:"started_at"`
+	Question  string    `json:"question"`
 	Answer    string    `json:"answer,omitempty"`
 	Done      bool      `json:"done,omitempty"`
+	Success   bool      `json:"success,omitempty"`
 }
 
 const pendingLockTTL = 40 * time.Second

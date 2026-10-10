@@ -182,8 +182,11 @@ func TestContinueReturnsBackgroundAnswer(t *testing.T) {
 	if again := call(t, h, 0, "Первый вопрос", "s"); again.Response.Text != first.Response.Text {
 		t.Fatal("duplicate question changed while pending")
 	}
-	if waiting := call(t, h, 1, "продолжить", "s"); !strings.Contains(waiting.Response.Text, "ещё думаю") {
+	if waiting := call(t, h, 1, "продолжить", "s"); waiting.Response.Text != waitingText {
 		t.Fatalf("bad waiting response: %q", waiting.Response.Text)
+	}
+	if waiting := call(t, h, 2, "продолжить", "s"); waiting.Response.Text != waitingText {
+		t.Fatalf("bad repeated waiting response: %q", waiting.Response.Text)
 	}
 	close(release)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -191,14 +194,14 @@ func TestContinueReturnsBackgroundAnswer(t *testing.T) {
 	if err := s.Wait(ctx); err != nil {
 		t.Fatal(err)
 	}
-	ready := call(t, h, 2, "продолжить", "s")
+	ready := call(t, h, 3, "продолжить", "s")
 	if ready.Response.Text != "Готовый ответ." || string(ready.SessionState["turns"]) != "1" {
 		t.Fatalf("cached answer missing: %+v", ready)
 	}
-	if again := call(t, h, 2, "продолжить", "s"); again.Response.Text != ready.Response.Text {
+	if again := call(t, h, 3, "продолжить", "s"); again.Response.Text != ready.Response.Text {
 		t.Fatal("duplicate continuation changed")
 	}
-	continued := call(t, h, 3, "продолжить", "s")
+	continued := call(t, h, 4, "продолжить", "s")
 	if continued.Response.Text != "Готовый ответ." {
 		t.Fatalf("model did not handle continuation: %q", continued.Response.Text)
 	}
@@ -233,6 +236,30 @@ func TestContinueAfterImmediateAnswerGoesToModel(t *testing.T) {
 	defer mu.Unlock()
 	if len(inputs) != 2 || len(inputs[1]) != 3 || inputs[1][0].Content != "Вопрос" || inputs[1][1].Content != "Ответ" || inputs[1][2].Content != "продолжить" {
 		t.Fatalf("wrong continuation history: %+v", inputs)
+	}
+}
+func TestContinueReceivesAnswerWhileWaiting(t *testing.T) {
+	release := make(chan struct{})
+	s, m := fixtureServer(generatorFunc(func(_ context.Context, messages []Message) (string, error) {
+		if messages[len(messages)-1].Content == "Вопрос" {
+			<-release
+		}
+		return "Ответ", nil
+	}))
+	s.Config.GPTTimeout = 150 * time.Millisecond
+	s.Config.GPTBackgroundTimeout = 2 * time.Second
+	h := s.Handler()
+	if r := call(t, h, 0, "Вопрос", "s"); r.Response.Text != thinkingText {
+		t.Fatalf("expected initial waiting: %q", r.Response.Text)
+	}
+	time.AfterFunc(20*time.Millisecond, func() { close(release) })
+	if r := call(t, h, 1, "продолжить", "s"); r.Response.Text != "Ответ" {
+		t.Fatalf("answer was not delivered during wait: %q", r.Response.Text)
+	}
+	for _, c := range m.data {
+		if c.Pending != nil || len(c.Messages) != 2 || c.Turns != 1 || c.LastID != 1 {
+			t.Fatalf("answer was not marked delivered: %+v", c)
+		}
 	}
 }
 func TestGenerationFailureDoesNotClaimTimeout(t *testing.T) {
@@ -273,17 +300,83 @@ func TestValidation(t *testing.T) {
 }
 func TestConcurrentSession(t *testing.T) {
 	entered := make(chan struct{})
-	release := make(chan struct{})
-	h, _ := fixture(generatorFunc(func(context.Context, []Message) (string, error) { close(entered); <-release; return "Ответ", nil }))
+	canceled := make(chan struct{})
+	var mu sync.Mutex
+	var inputs [][]Message
+	s, m := fixtureServer(generatorFunc(func(ctx context.Context, messages []Message) (string, error) {
+		mu.Lock()
+		inputs = append(inputs, append([]Message{}, messages...))
+		mu.Unlock()
+		if messages[len(messages)-1].Content == "первый" {
+			close(entered)
+			<-ctx.Done()
+			close(canceled)
+			return "", ctx.Err()
+		}
+		return "Новый ответ", nil
+	}))
+	s.Config.MaxConcurrent = 1
+	s.slots = make(chan struct{}, 1)
+	h := s.Handler()
 	done := make(chan struct{})
 	go func() { defer close(done); call(t, h, 0, "первый", "s") }()
 	<-entered
 	r := call(t, h, 1, "второй", "s")
-	if !strings.Contains(r.Response.Text, "думаю") {
-		t.Fatal("concurrent request not blocked")
+	if r.Response.Text != "Новый ответ" {
+		t.Fatalf("new phrase was not forwarded: %q", r.Response.Text)
+	}
+	<-canceled
+	<-done
+	mu.Lock()
+	defer mu.Unlock()
+	if len(inputs) != 2 || len(inputs[1]) != 1 || inputs[1][0].Content != "второй" {
+		t.Fatalf("canceled request leaked into history: %+v", inputs)
+	}
+	for _, c := range m.data {
+		if len(c.Messages) != 2 || c.Messages[0].Content != "второй" || c.Pending != nil {
+			t.Fatalf("canceled request persisted: %+v", c)
+		}
+	}
+}
+
+func TestNewPhraseDiscardsUndeliveredAnswer(t *testing.T) {
+	release := make(chan struct{})
+	var mu sync.Mutex
+	var inputs [][]Message
+	s, m := fixtureServer(generatorFunc(func(_ context.Context, messages []Message) (string, error) {
+		mu.Lock()
+		inputs = append(inputs, append([]Message{}, messages...))
+		mu.Unlock()
+		if messages[len(messages)-1].Content == "Старый вопрос" {
+			<-release
+			return "Старый ответ", nil
+		}
+		return "Новый ответ", nil
+	}))
+	s.Config.GPTBackgroundTimeout = 2 * time.Second
+	h := s.Handler()
+	if r := call(t, h, 0, "Старый вопрос", "s"); r.Response.Text != thinkingText {
+		t.Fatalf("expected initial waiting: %q", r.Response.Text)
 	}
 	close(release)
-	<-done
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := s.Wait(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if r := call(t, h, 1, "Новый вопрос", "s"); r.Response.Text != "Новый ответ" {
+		t.Fatalf("new phrase was not forwarded: %q", r.Response.Text)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(inputs) != 2 || len(inputs[1]) != 1 || inputs[1][0].Content != "Новый вопрос" {
+		t.Fatalf("undelivered answer leaked into history: %+v", inputs)
+	}
+	for _, c := range m.data {
+		if len(c.Messages) != 2 || c.Messages[0].Content != "Новый вопрос" || c.Pending != nil {
+			t.Fatalf("undelivered answer persisted: %+v", c)
+		}
+	}
 }
 func TestVoiceText(t *testing.T) {
 	for _, s := range []string{strings.Repeat("длинный текст ", 100), "**Привет**\nмир", strings.Repeat("я", 1000)} {

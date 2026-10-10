@@ -57,10 +57,22 @@ type Server struct {
 	Log    *slog.Logger
 	slots  chan struct{}
 	jobs   sync.WaitGroup
+	mu     sync.Mutex
+	active map[string]generation
 }
 
+type generation struct {
+	token  string
+	cancel context.CancelFunc
+}
+
+const (
+	thinkingText = "Думаю... чтобы продолжить скажи продолжить"
+	waitingText  = "Все еще думаю.... чтобы продолжить скажи продолжить"
+)
+
 func NewServer(c Config, s Store, g Generator, l *slog.Logger) *Server {
-	return &Server{Config: c, Store: s, GPT: g, Log: l, slots: make(chan struct{}, c.MaxConcurrent)}
+	return &Server{Config: c, Store: s, GPT: g, Log: l, slots: make(chan struct{}, c.MaxConcurrent), active: make(map[string]generation)}
 }
 
 func (s *Server) Wait(ctx context.Context) error {
@@ -159,18 +171,28 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		if current.Reply != nil && current.LastID == req.Session.MessageID {
 			if current.Pending != nil && current.Pending.Done {
 				ackCtx, cancel := context.WithTimeout(ctx, 350*time.Millisecond)
-				s.ackInitial(ackCtx, key, token+":ack", req.Session.MessageID)
+				if reply, ok := s.ackInitial(ackCtx, key, token+":ack", req.Session.MessageID); ok {
+					current.Reply = &reply
+				}
 				cancel()
 			}
 			writeReply(w, *current.Reply)
 			return
 		}
-		if command == "продолжить" {
+		if command == "продолжить" && current.Pending != nil {
 			writeReply(w, s.awaitPending(ctx, key, token, req.Session.MessageID, state))
 			return
 		}
-		respond("Я ещё думаю. Скажите «продолжить».", false)
-		return
+		if current.Pending != nil && !current.Pending.Done {
+			s.cancelGeneration(key)
+		}
+		waitCtx, stop := context.WithTimeout(ctx, 700*time.Millisecond)
+		locked, err = s.acquire(waitCtx, key, token)
+		stop()
+		if err != nil || !locked {
+			respond("Предыдущий запрос ещё отменяется. Повторите фразу.", false)
+			return
+		}
 	}
 	owned := true
 	defer func() {
@@ -186,10 +208,9 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 	}
 	if c.Reply != nil && req.Session.MessageID == c.LastID {
 		if c.Pending != nil && c.Pending.Done {
-			c.Pending = nil
-			if err := s.Store.Save(ctx, key, c); err != nil {
-				s.Log.Warn("redis write failed")
-			}
+			reply, _ := s.deliverPending(ctx, key, c, req.Session.MessageID, state)
+			writeReply(w, reply)
+			return
 		}
 		writeReply(w, *c.Reply)
 		return
@@ -199,17 +220,14 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if c.Pending != nil {
-		if time.Since(c.Pending.StartedAt) > pendingLockTTL && !c.Pending.Done {
-			c.Pending = nil
-			if err := s.Store.Save(ctx, key, c); err != nil {
-				s.Log.Warn("redis write failed")
-			}
-			respond("Ответ не получен. Повторите вопрос.", false)
-			return
-		}
 		if command == "продолжить" {
 			if c.Pending.Done {
-				writeReply(w, s.deliverPending(ctx, key, c, req.Session.MessageID, state))
+				reply, _ := s.deliverPending(ctx, key, c, req.Session.MessageID, state)
+				writeReply(w, reply)
+				return
+			}
+			if time.Since(c.Pending.StartedAt) > pendingLockTTL {
+				respond("Ответ не получен. Повторите вопрос.", false)
 				return
 			}
 			s.release(key, token)
@@ -217,12 +235,13 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 			writeReply(w, s.awaitPending(ctx, key, token, req.Session.MessageID, state))
 			return
 		}
-		if c.Pending.Done {
-			respond("Ответ готов. Скажите «продолжить».", false)
-		} else {
-			respond("Я ещё думаю. Скажите «продолжить».", false)
+		s.cancelGeneration(key)
+		c.Pending = nil
+		if err := s.Store.Save(ctx, key, c); err != nil {
+			s.Log.Warn("redis write failed")
+			respond("Не удалось сохранить разговор. Повторите фразу.", false)
+			return
 		}
-		return
 	}
 	allowed, err := s.Store.Allow(ctx, "alice:limit:"+digest(req.Session.SkillID+":"+identity), s.Config.RequestsPerMinute)
 	if err != nil || !allowed {
@@ -256,28 +275,40 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 			}
 			state["turns"], _ = json.Marshal(c.Turns)
 			state["last_message_id"], _ = json.Marshal(req.Session.MessageID)
-			thinking := newReply("Думаю... чтобы продолжить скажи продолжить", false, cloneState(state))
+			thinking := newReply(thinkingText, false, cloneState(state))
 			c.LastID = req.Session.MessageID
 			c.Reply = &thinking
-			c.Pending = &Pending{StartedAt: time.Now().UTC()}
+			c.Pending = &Pending{StartedAt: time.Now().UTC(), Question: text}
 			if err := s.Store.Save(ctx, key, c); err != nil {
 				<-s.slots
 				s.Log.Warn("redis write failed")
 				respond("Не удалось сохранить разговор. Повторите вопрос.", false)
 				return
 			}
-			done := make(chan Reply, 1)
+			done := make(chan bool, 1)
+			jobCtx, jobCancel := context.WithTimeout(context.Background(), s.Config.GPTBackgroundTimeout)
+			s.mu.Lock()
+			s.active[key] = generation{token: token, cancel: jobCancel}
+			s.mu.Unlock()
 			s.jobs.Add(1)
 			owned = false
-			go s.generate(key, token, c, text, cloneState(state), done)
+			go s.generate(jobCtx, jobCancel, key, token, c, text, done)
 			waitCtx, stop := context.WithTimeout(ctx, s.Config.GPTTimeout)
 			defer stop()
 			select {
-			case reply := <-done:
+			case saved := <-done:
+				if !saved {
+					respond("Запрос отменён или ответ не сохранён. Повторите вопрос.", false)
+					return
+				}
 				ackCtx, cancel := context.WithTimeout(ctx, 350*time.Millisecond)
-				s.ackInitial(ackCtx, key, token+":ack", req.Session.MessageID)
+				reply, ok := s.ackInitial(ackCtx, key, token+":ack", req.Session.MessageID)
 				cancel()
-				writeReply(w, reply)
+				if ok {
+					writeReply(w, reply)
+				} else {
+					writeReply(w, thinking)
+				}
 			case <-waitCtx.Done():
 				writeReply(w, thinking)
 			}
@@ -308,16 +339,53 @@ func (s *Server) release(key, token string) {
 	s.Store.Release(ctx, key, token)
 }
 
-func (s *Server) generate(key, token string, c Conversation, question string, state map[string]json.RawMessage, done chan<- Reply) {
-	defer s.jobs.Done()
-	defer func() { <-s.slots }()
-	defer s.release(key, token)
+func (s *Server) acquire(ctx context.Context, key, token string) (bool, error) {
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		locked, err := s.Store.Acquire(ctx, key, token)
+		if locked || err != nil {
+			return locked, err
+		}
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
 
-	ctx, cancel := context.WithTimeout(context.Background(), s.Config.GPTBackgroundTimeout)
+func (s *Server) cancelGeneration(key string) {
+	s.mu.Lock()
+	active, ok := s.active[key]
+	s.mu.Unlock()
+	if ok {
+		active.cancel()
+	}
+}
+
+func (s *Server) unregister(key, token string) {
+	s.mu.Lock()
+	if s.active[key].token == token {
+		delete(s.active, key)
+	}
+	s.mu.Unlock()
+}
+
+func (s *Server) generate(ctx context.Context, cancel context.CancelFunc, key, token string, c Conversation, question string, done chan<- bool) {
+	defer s.jobs.Done()
+	defer s.release(key, token)
+	defer func() { <-s.slots }()
+	defer s.unregister(key, token)
+	defer cancel()
+
 	input := append(append([]Message{}, c.Messages...), Message{Role: "user", Content: question})
 	generated, err := s.GPT.Generate(ctx, input)
 	timedOut := errors.Is(ctx.Err(), context.DeadlineExceeded)
-	cancel()
+	if errors.Is(ctx.Err(), context.Canceled) {
+		done <- false
+		return
+	}
 	answer := voiceText(generated, s.Config.MaxAnswerChars)
 	success := err == nil && !timedOut && answer != ""
 	if !success {
@@ -327,57 +395,38 @@ func (s *Server) generate(key, token string, c Conversation, question string, st
 			s.Log.Warn("generation returned empty response")
 		}
 		answer = "Не удалось получить ответ. Повторите вопрос."
-	} else {
-		c.Messages = append(append([]Message{}, c.Messages...), Message{Role: "user", Content: question}, Message{Role: "assistant", Content: answer})
-		if n := len(c.Messages) - s.Config.HistoryTurns*2; n > 0 {
-			c.Messages = c.Messages[n:]
-		}
-		c.Turns++
 	}
-	c.Pending = &Pending{StartedAt: c.Pending.StartedAt, Answer: answer, Done: true}
-	state["turns"], _ = json.Marshal(c.Turns)
-	reply := newReply(answer, false, state)
-	c.Reply = &reply
+	c.Pending = &Pending{StartedAt: c.Pending.StartedAt, Question: question, Answer: answer, Done: true, Success: success}
+	if errors.Is(ctx.Err(), context.Canceled) {
+		done <- false
+		return
+	}
 	saveCtx, stop := context.WithTimeout(context.Background(), time.Second)
 	err = s.Store.Save(saveCtx, key, c)
 	stop()
 	if err != nil {
 		s.Log.Warn("redis write failed after generation", "error", err)
-		s.release(key, token)
-		done <- newReply("Не удалось сохранить ответ. Повторите вопрос.", false, state)
+		done <- false
 		return
 	}
-	s.release(key, token)
-	done <- reply
+	done <- true
 }
 
-func (s *Server) ackInitial(ctx context.Context, key, token string, messageID int) {
-	ticker := time.NewTicker(20 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		locked, err := s.Store.Acquire(ctx, key, token)
-		if err != nil {
-			s.Log.Warn("redis lock failed")
-			return
-		}
-		if locked {
-			c, err := s.Store.Load(ctx, key)
-			if err == nil && c.LastID == messageID && c.Pending != nil && c.Pending.Done {
-				c.Pending = nil
-				err = s.Store.Save(ctx, key, c)
-			}
-			if err != nil {
-				s.Log.Warn("redis write failed")
-			}
-			s.release(key, token)
-			return
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
+func (s *Server) ackInitial(ctx context.Context, key, token string, messageID int) (Reply, bool) {
+	locked, err := s.acquire(ctx, key, token)
+	if err != nil || !locked {
+		return Reply{}, false
 	}
+	defer s.release(key, token)
+	c, err := s.Store.Load(ctx, key)
+	if err != nil {
+		s.Log.Warn("redis read failed")
+		return Reply{}, false
+	}
+	if c.LastID != messageID || c.Pending == nil || !c.Pending.Done {
+		return Reply{}, false
+	}
+	return s.deliverPending(ctx, key, c, messageID, c.Reply.SessionState)
 }
 
 func (s *Server) awaitPending(ctx context.Context, key, token string, messageID int, state map[string]json.RawMessage) Reply {
@@ -395,7 +444,7 @@ func (s *Server) awaitPending(ctx context.Context, key, token string, messageID 
 			return *c.Reply
 		}
 		if c.Pending == nil {
-			return newReply("Всё ещё думаю... скажи продолжить", false, state)
+			return newReply("Ответ уже получен. Повторите команду.", false, state)
 		}
 		if c.Pending.Done {
 			locked, err := s.Store.Acquire(waitCtx, key, token)
@@ -412,7 +461,7 @@ func (s *Server) awaitPending(ctx context.Context, key, token string, messageID 
 				case current.Reply != nil && current.LastID == messageID:
 					reply = *current.Reply
 				case current.Pending != nil && current.Pending.Done:
-					reply = s.deliverPending(waitCtx, key, current, messageID, state)
+					reply, _ = s.deliverPending(waitCtx, key, current, messageID, state)
 				default:
 					reply = newReply("Ответ уже получен. Задайте вопрос.", false, state)
 				}
@@ -425,14 +474,21 @@ func (s *Server) awaitPending(ctx context.Context, key, token string, messageID 
 		}
 		select {
 		case <-waitCtx.Done():
-			return newReply("Всё ещё думаю... скажи продолжить", false, state)
+			return newReply(waitingText, false, state)
 		case <-ticker.C:
 		}
 	}
 }
 
-func (s *Server) deliverPending(ctx context.Context, key string, c Conversation, messageID int, state map[string]json.RawMessage) Reply {
+func (s *Server) deliverPending(ctx context.Context, key string, c Conversation, messageID int, state map[string]json.RawMessage) (Reply, bool) {
 	state = cloneState(state)
+	if c.Pending.Success {
+		c.Messages = append(c.Messages, Message{Role: "user", Content: c.Pending.Question}, Message{Role: "assistant", Content: c.Pending.Answer})
+		if n := len(c.Messages) - s.Config.HistoryTurns*2; n > 0 {
+			c.Messages = c.Messages[n:]
+		}
+		c.Turns++
+	}
 	state["turns"], _ = json.Marshal(c.Turns)
 	state["last_message_id"], _ = json.Marshal(messageID)
 	reply := newReply(c.Pending.Answer, false, state)
@@ -441,9 +497,9 @@ func (s *Server) deliverPending(ctx context.Context, key string, c Conversation,
 	c.Reply = &reply
 	if err := s.Store.Save(ctx, key, c); err != nil {
 		s.Log.Warn("redis write failed")
-		return newReply("Не удалось сохранить ответ. Повторите вопрос.", false, state)
+		return newReply("Не удалось сохранить ответ. Повторите вопрос.", false, state), false
 	}
-	return reply
+	return reply, true
 }
 
 func cloneState(state map[string]json.RawMessage) map[string]json.RawMessage {
