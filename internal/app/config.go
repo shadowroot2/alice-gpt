@@ -25,7 +25,7 @@ func LoadConfig() (Config, error) {
 	if c.GPTBackgroundTimeout, err = time.ParseDuration(env("GPT_BACKGROUND_TIMEOUT", "25s")); err != nil || c.GPTBackgroundTimeout < 5*time.Second || c.GPTBackgroundTimeout > 30*time.Second {
 		return c, fmt.Errorf("GPT_BACKGROUND_TIMEOUT must be between 5s and 30s")
 	}
-	if c.SessionTTL, err = time.ParseDuration(env("SESSION_TTL", "30m")); err != nil || c.SessionTTL < time.Minute || c.SessionTTL > 24*time.Hour {
+	if c.SessionTTL, err = time.ParseDuration(env("SESSION_TTL", "24h")); err != nil || c.SessionTTL < time.Minute || c.SessionTTL > 24*time.Hour {
 		return c, fmt.Errorf("SESSION_TTL must be between 1m and 24h")
 	}
 	for _, v := range []struct {
