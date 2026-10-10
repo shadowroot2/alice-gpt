@@ -6,4 +6,5 @@ coverage.out
 README.md
 dist/
 assets/
+config/
 .DS_Store

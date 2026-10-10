@@ -392,23 +392,41 @@ func TestOpenAI(t *testing.T) {
 			t.Error("wrong request")
 		}
 		var body struct {
-			Store bool
-			Input []Message
-			Model string
+			Store        bool
+			Input        []Message
+			Model        string
+			Instructions string
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Error(err)
 		}
-		if body.Store || body.Model != "test-model" || len(body.Input) != 1 {
+		if body.Store || body.Model != "test-model" || len(body.Input) != 1 || !strings.Contains(body.Instructions, "колонке Яндекса") || !strings.Contains(body.Instructions, "Твоя модель: test-model") {
 			t.Error("wrong body")
 		}
 		io.WriteString(w, `{"output":[{"type":"message","content":[{"type":"output_text","text":"Привет"}]}]}`)
 	}))
 	defer upstream.Close()
-	o := OpenAI{Key: "test-key", Model: "test-model", URL: upstream.URL + "/v1/responses", Client: upstream.Client()}
+	o := OpenAI{Key: "test-key", Model: "test-model", URL: upstream.URL + "/v1/responses", Instructions: "На колонке Яндекса. Твоя модель: test-model", Client: upstream.Client()}
 	answer, err := o.Generate(context.Background(), []Message{{"user", "вопрос"}})
 	if err != nil || answer != "Привет" {
 		t.Fatalf("%q %v", answer, err)
+	}
+}
+func TestOpenAIWithoutRoleOmitsInstructions(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+		}
+		if _, ok := body["instructions"]; ok {
+			t.Error("role instructions sent without a role file")
+		}
+		io.WriteString(w, `{"output":[{"type":"message","content":[{"type":"output_text","text":"Ответ"}]}]}`)
+	}))
+	defer upstream.Close()
+	o := OpenAI{Model: "test-model", URL: upstream.URL, Client: upstream.Client()}
+	if _, err := o.Generate(context.Background(), nil); err != nil {
+		t.Fatal(err)
 	}
 }
 func TestOpenAIErrors(t *testing.T) {

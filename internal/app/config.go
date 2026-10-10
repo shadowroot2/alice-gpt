@@ -2,19 +2,21 @@ package app
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
 type Config struct {
-	APIKey, Model, RedisURL, SkillID, WebhookToken, Listen         string
-	GPTTimeout, GPTBackgroundTimeout, SessionTTL                   time.Duration
-	HistoryTurns, MaxAnswerChars, RequestsPerMinute, MaxConcurrent int
+	APIKey, Model, RedisURL, SkillID, WebhookToken, Listen, RoleFile, Role string
+	GPTTimeout, GPTBackgroundTimeout, SessionTTL                           time.Duration
+	HistoryTurns, MaxAnswerChars, RequestsPerMinute, MaxConcurrent         int
 }
 
 func LoadConfig() (Config, error) {
-	c := Config{APIKey: os.Getenv("GPT_API_KEY"), Model: env("GPT_MODEL", "gpt-4.1-mini"), RedisURL: env("REDIS_URL", "redis://redis:6379/0"), SkillID: os.Getenv("ALICE_SKILL_ID"), WebhookToken: os.Getenv("WEBHOOK_TOKEN"), Listen: env("LISTEN_ADDR", ":8080")}
+	c := Config{APIKey: os.Getenv("GPT_API_KEY"), Model: env("GPT_MODEL", "gpt-4.1-mini"), RedisURL: env("REDIS_URL", "redis://redis:6379/0"), SkillID: os.Getenv("ALICE_SKILL_ID"), WebhookToken: os.Getenv("WEBHOOK_TOKEN"), Listen: env("LISTEN_ADDR", ":8080"), RoleFile: env("ROLE_FILE", "/config/role.txt")}
 	if c.APIKey == "" || c.SkillID == "" || len(c.WebhookToken) < 32 {
 		return c, fmt.Errorf("GPT_API_KEY, ALICE_SKILL_ID and WEBHOOK_TOKEN (at least 32 characters) are required")
 	}
@@ -41,6 +43,22 @@ func LoadConfig() (Config, error) {
 		}
 		*v.target = n
 	}
+	roleFile, err := os.Open(c.RoleFile)
+	if os.IsNotExist(err) {
+		return c, nil
+	}
+	if err != nil {
+		return c, fmt.Errorf("read ROLE_FILE: %w", err)
+	}
+	defer roleFile.Close()
+	role, err := io.ReadAll(io.LimitReader(roleFile, (8<<10)+1))
+	if err != nil {
+		return c, fmt.Errorf("read ROLE_FILE: %w", err)
+	}
+	if len(role) > 8<<10 {
+		return c, fmt.Errorf("ROLE_FILE must be at most 8 KiB")
+	}
+	c.Role = strings.ReplaceAll(strings.TrimSpace(string(role)), "${GPT_MODEL}", c.Model)
 	return c, nil
 }
 func env(k, fallback string) string {

@@ -19,12 +19,16 @@ type Generator interface {
 	Generate(context.Context, []Message) (string, error)
 }
 type OpenAI struct {
-	Key, Model, URL string
-	Client          *http.Client
+	Key, Model, URL, Instructions string
+	Client                        *http.Client
 }
 
 func (o *OpenAI) Generate(ctx context.Context, messages []Message) (string, error) {
-	body, err := json.Marshal(map[string]any{"model": o.Model, "input": messages, "store": false, "max_output_tokens": 220, "instructions": "Ты голосовой помощник. Отвечай по-русски, кратко: одно-три коротких предложения, не более 450 символов. Без Markdown, списков, ссылок, эмодзи и разметки речи. Не выдумывай факты. При необходимости задай один уточняющий вопрос."})
+	request := map[string]any{"model": o.Model, "input": messages, "store": false, "max_output_tokens": 220}
+	if o.Instructions != "" {
+		request["instructions"] = o.Instructions
+	}
+	body, err := json.Marshal(request)
 	if err != nil {
 		return "", err
 	}

@@ -52,7 +52,7 @@ func run(log *slog.Logger) error {
 	client := redis.NewClient(opts)
 	defer client.Close()
 	transport := &http.Transport{Proxy: http.ProxyFromEnvironment, DialContext: (&net.Dialer{Timeout: time.Second, KeepAlive: 30 * time.Second}).DialContext, ForceAttemptHTTP2: true, MaxIdleConns: 32, MaxIdleConnsPerHost: 16, IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: time.Second, ResponseHeaderTimeout: cfg.GPTBackgroundTimeout}
-	gpt := &app.OpenAI{Key: cfg.APIKey, Model: cfg.Model, URL: "https://api.openai.com/v1/responses", Client: &http.Client{Transport: transport, Timeout: cfg.GPTBackgroundTimeout}}
+	gpt := &app.OpenAI{Key: cfg.APIKey, Model: cfg.Model, URL: "https://api.openai.com/v1/responses", Instructions: cfg.Role, Client: &http.Client{Transport: transport, Timeout: cfg.GPTBackgroundTimeout}}
 	appServer := app.NewServer(cfg, &app.RedisStore{Client: client, TTL: cfg.SessionTTL}, gpt, log)
 	handler := appServer.Handler()
 	srv := &http.Server{Addr: cfg.Listen, Handler: handler, ReadHeaderTimeout: time.Second, ReadTimeout: 2 * time.Second, WriteTimeout: 4200 * time.Millisecond, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10}

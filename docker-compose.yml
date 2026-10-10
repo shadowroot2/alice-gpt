@@ -4,6 +4,8 @@ services:
     platform: linux/amd64
     restart: unless-stopped
     env_file: .env
+    volumes:
+      - ./config:/config:ro
     environment:
       REDIS_URL: redis://redis:6379/0
       LISTEN_ADDR: :8080
