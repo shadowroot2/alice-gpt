@@ -15,7 +15,17 @@ type Conversation struct {
 	LastID   int       `json:"last_id"`
 	Reply    *Reply    `json:"reply,omitempty"`
 	Turns    int       `json:"turns"`
+	Pending  *Pending  `json:"pending,omitempty"`
 }
+
+type Pending struct {
+	StartedAt time.Time `json:"started_at"`
+	Answer    string    `json:"answer,omitempty"`
+	Done      bool      `json:"done,omitempty"`
+}
+
+const pendingLockTTL = 40 * time.Second
+
 type Store interface {
 	Ping(context.Context) error
 	Acquire(context.Context, string, string) (bool, error)
@@ -31,7 +41,7 @@ type RedisStore struct {
 
 func (s *RedisStore) Ping(ctx context.Context) error { return s.Client.Ping(ctx).Err() }
 func (s *RedisStore) Acquire(ctx context.Context, k, t string) (bool, error) {
-	return s.Client.SetNX(ctx, k+":lock", t, 10*time.Second).Result()
+	return s.Client.SetNX(ctx, k+":lock", t, pendingLockTTL).Result()
 }
 
 var unlock = redis.NewScript(`if redis.call('get',KEYS[1]) == ARGV[1] then return redis.call('del',KEYS[1]) else return 0 end`)

@@ -51,9 +51,10 @@ func run(log *slog.Logger) error {
 	opts.ContextTimeoutEnabled = true
 	client := redis.NewClient(opts)
 	defer client.Close()
-	transport := &http.Transport{Proxy: http.ProxyFromEnvironment, DialContext: (&net.Dialer{Timeout: time.Second, KeepAlive: 30 * time.Second}).DialContext, ForceAttemptHTTP2: true, MaxIdleConns: 32, MaxIdleConnsPerHost: 16, IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: time.Second, ResponseHeaderTimeout: cfg.GPTTimeout}
-	gpt := &app.OpenAI{Key: cfg.APIKey, Model: cfg.Model, URL: "https://api.openai.com/v1/responses", Client: &http.Client{Transport: transport, Timeout: cfg.GPTTimeout}}
-	handler := app.NewServer(cfg, &app.RedisStore{Client: client, TTL: cfg.SessionTTL}, gpt, log).Handler()
+	transport := &http.Transport{Proxy: http.ProxyFromEnvironment, DialContext: (&net.Dialer{Timeout: time.Second, KeepAlive: 30 * time.Second}).DialContext, ForceAttemptHTTP2: true, MaxIdleConns: 32, MaxIdleConnsPerHost: 16, IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: time.Second, ResponseHeaderTimeout: cfg.GPTBackgroundTimeout}
+	gpt := &app.OpenAI{Key: cfg.APIKey, Model: cfg.Model, URL: "https://api.openai.com/v1/responses", Client: &http.Client{Transport: transport, Timeout: cfg.GPTBackgroundTimeout}}
+	appServer := app.NewServer(cfg, &app.RedisStore{Client: client, TTL: cfg.SessionTTL}, gpt, log)
+	handler := appServer.Handler()
 	srv := &http.Server{Addr: cfg.Listen, Handler: handler, ReadHeaderTimeout: time.Second, ReadTimeout: 2 * time.Second, WriteTimeout: 4200 * time.Millisecond, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -61,7 +62,13 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	return serve(ctx, srv, listener, log)
+	serveErr := serve(ctx, srv, listener, log)
+	waitCtx, cancel := context.WithTimeout(context.Background(), cfg.GPTBackgroundTimeout+2*time.Second)
+	defer cancel()
+	if err := appServer.Wait(waitCtx); err != nil && serveErr == nil {
+		return err
+	}
+	return serveErr
 }
 
 func serve(ctx context.Context, srv *http.Server, listener net.Listener, log *slog.Logger) error {

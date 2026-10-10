@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -55,10 +56,22 @@ type Server struct {
 	GPT    Generator
 	Log    *slog.Logger
 	slots  chan struct{}
+	jobs   sync.WaitGroup
 }
 
 func NewServer(c Config, s Store, g Generator, l *slog.Logger) *Server {
-	return &Server{c, s, g, l, make(chan struct{}, c.MaxConcurrent)}
+	return &Server{Config: c, Store: s, GPT: g, Log: l, slots: make(chan struct{}, c.MaxConcurrent)}
+}
+
+func (s *Server) Wait(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() { s.jobs.Wait(); close(done) }()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 func (s *Server) Handler() http.Handler {
 	router := chi.NewRouter()
@@ -111,6 +124,11 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		respond("Пожалуйста, задайте вопрос голосом.", false)
 		return
 	}
+	text := strings.TrimSpace(req.Request.Command)
+	if text == "" && !req.Session.New {
+		text = strings.TrimSpace(req.Request.Original)
+	}
+	command := strings.Trim(strings.ToLower(text), " .!?,")
 	identity := req.Session.User.ID
 	if identity == "" {
 		identity = req.Session.Application.ID
@@ -132,13 +150,33 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !locked {
-		respond("Предыдущий вопрос ещё обрабатывается. Повторите через секунду.", false)
+		current, loadErr := s.Store.Load(ctx, key)
+		if loadErr != nil {
+			s.Log.Warn("redis read failed")
+			respond("Не удалось прочитать историю. Попробуйте позже.", false)
+			return
+		}
+		if current.Reply != nil && current.LastID == req.Session.MessageID {
+			if current.Pending != nil && current.Pending.Done {
+				ackCtx, cancel := context.WithTimeout(ctx, 350*time.Millisecond)
+				s.ackInitial(ackCtx, key, token+":ack", req.Session.MessageID)
+				cancel()
+			}
+			writeReply(w, *current.Reply)
+			return
+		}
+		if command == "продолжить" {
+			writeReply(w, s.awaitPending(ctx, key, token, req.Session.MessageID, state))
+			return
+		}
+		respond("Я ещё думаю. Скажите «продолжить».", false)
 		return
 	}
+	owned := true
 	defer func() {
-		c, stop := context.WithTimeout(context.Background(), 150*time.Millisecond)
-		defer stop()
-		s.Store.Release(c, key, token)
+		if owned {
+			s.release(key, token)
+		}
 	}()
 	c, err := s.Store.Load(ctx, key)
 	if err != nil {
@@ -147,6 +185,12 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if c.Reply != nil && req.Session.MessageID == c.LastID {
+		if c.Pending != nil && c.Pending.Done {
+			c.Pending = nil
+			if err := s.Store.Save(ctx, key, c); err != nil {
+				s.Log.Warn("redis write failed")
+			}
+		}
 		writeReply(w, *c.Reply)
 		return
 	}
@@ -154,18 +198,36 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		respond("Этот вопрос уже обработан. Задайте следующий.", false)
 		return
 	}
+	if c.Pending != nil {
+		if time.Since(c.Pending.StartedAt) > pendingLockTTL && !c.Pending.Done {
+			c.Pending = nil
+			if err := s.Store.Save(ctx, key, c); err != nil {
+				s.Log.Warn("redis write failed")
+			}
+			respond("Ответ не получен. Повторите вопрос.", false)
+			return
+		}
+		if command == "продолжить" {
+			if c.Pending.Done {
+				writeReply(w, s.deliverPending(ctx, key, c, req.Session.MessageID, state))
+				return
+			}
+			s.release(key, token)
+			owned = false
+			writeReply(w, s.awaitPending(ctx, key, token, req.Session.MessageID, state))
+			return
+		}
+		if c.Pending.Done {
+			respond("Ответ готов. Скажите «продолжить».", false)
+		} else {
+			respond("Я ещё думаю. Скажите «продолжить».", false)
+		}
+		return
+	}
 	allowed, err := s.Store.Allow(ctx, "alice:limit:"+digest(req.Session.SkillID+":"+identity), s.Config.RequestsPerMinute)
 	if err != nil || !allowed {
 		respond("Слишком много запросов. Подождите минуту.", false)
 		return
-	}
-	text := strings.TrimSpace(req.Request.Command)
-	if text == "" && !req.Session.New {
-		text = strings.TrimSpace(req.Request.Original)
-	}
-	command := strings.Trim(strings.ToLower(strings.TrimSpace(req.Request.Command)), " .!?,")
-	if command == "" {
-		command = strings.Trim(strings.ToLower(text), " .!?,")
 	}
 	answer := ""
 	end := false
@@ -179,7 +241,7 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		answer = "Начинаем заново. О чём поговорим?"
 		reset = true
 	case "помощь", "что ты умеешь":
-		answer = "Отвечаю на вопросы и помню наш разговор. Скажите «сброс», чтобы очистить историю, или «выход»."
+		answer = "Отвечаю на вопросы и помню разговор. Если я думаю, скажите «продолжить». Для очистки истории скажите «сброс»."
 	default:
 		if text == "" {
 			answer = "Здравствуйте! Задайте вопрос."
@@ -192,30 +254,34 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 				respond("Сервис занят. Попробуйте через несколько секунд.", false)
 				return
 			}
-			gctx, stop := context.WithTimeout(ctx, s.Config.GPTTimeout)
-			generated, e := s.GPT.Generate(gctx, append(append([]Message{}, c.Messages...), Message{"user", text}))
-			timedOut := errors.Is(gctx.Err(), context.DeadlineExceeded)
-			stop()
-			<-s.slots
-			if e != nil {
-				s.Log.Warn("generation failed", "timeout", timedOut, "error", e)
-				message := "Не удалось получить ответ. Повторите вопрос."
-				if timedOut {
-					message = "Не удалось получить ответ вовремя. Повторите вопрос."
-				}
-				respond(message, false)
+			state["turns"], _ = json.Marshal(c.Turns)
+			state["last_message_id"], _ = json.Marshal(req.Session.MessageID)
+			thinking := newReply("Думаю... чтобы продолжить скажи продолжить", false, cloneState(state))
+			c.LastID = req.Session.MessageID
+			c.Reply = &thinking
+			c.Pending = &Pending{StartedAt: time.Now().UTC()}
+			if err := s.Store.Save(ctx, key, c); err != nil {
+				<-s.slots
+				s.Log.Warn("redis write failed")
+				respond("Не удалось сохранить разговор. Повторите вопрос.", false)
 				return
 			}
-			answer = voiceText(generated, s.Config.MaxAnswerChars)
-			if answer == "" {
-				respond("Не удалось получить ответ. Повторите вопрос.", false)
-				return
+			done := make(chan Reply, 1)
+			s.jobs.Add(1)
+			owned = false
+			go s.generate(key, token, c, text, cloneState(state), done)
+			waitCtx, stop := context.WithTimeout(ctx, s.Config.GPTTimeout)
+			defer stop()
+			select {
+			case reply := <-done:
+				ackCtx, cancel := context.WithTimeout(ctx, 350*time.Millisecond)
+				s.ackInitial(ackCtx, key, token+":ack", req.Session.MessageID)
+				cancel()
+				writeReply(w, reply)
+			case <-waitCtx.Done():
+				writeReply(w, thinking)
 			}
-			c.Messages = append(c.Messages, Message{"user", text}, Message{"assistant", answer})
-			if n := len(c.Messages) - s.Config.HistoryTurns*2; n > 0 {
-				c.Messages = c.Messages[n:]
-			}
-			c.Turns++
+			return
 		}
 	}
 	if reset {
@@ -235,6 +301,159 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 	}
 	writeReply(w, reply)
 }
+
+func (s *Server) release(key, token string) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	s.Store.Release(ctx, key, token)
+}
+
+func (s *Server) generate(key, token string, c Conversation, question string, state map[string]json.RawMessage, done chan<- Reply) {
+	defer s.jobs.Done()
+	defer func() { <-s.slots }()
+	defer s.release(key, token)
+
+	ctx, cancel := context.WithTimeout(context.Background(), s.Config.GPTBackgroundTimeout)
+	input := append(append([]Message{}, c.Messages...), Message{Role: "user", Content: question})
+	generated, err := s.GPT.Generate(ctx, input)
+	timedOut := errors.Is(ctx.Err(), context.DeadlineExceeded)
+	cancel()
+	answer := voiceText(generated, s.Config.MaxAnswerChars)
+	success := err == nil && !timedOut && answer != ""
+	if !success {
+		if err != nil {
+			s.Log.Warn("generation failed", "timeout", timedOut, "error", err)
+		} else {
+			s.Log.Warn("generation returned empty response")
+		}
+		answer = "Не удалось получить ответ. Повторите вопрос."
+	} else {
+		c.Messages = append(append([]Message{}, c.Messages...), Message{Role: "user", Content: question}, Message{Role: "assistant", Content: answer})
+		if n := len(c.Messages) - s.Config.HistoryTurns*2; n > 0 {
+			c.Messages = c.Messages[n:]
+		}
+		c.Turns++
+	}
+	c.Pending = &Pending{StartedAt: c.Pending.StartedAt, Answer: answer, Done: true}
+	state["turns"], _ = json.Marshal(c.Turns)
+	reply := newReply(answer, false, state)
+	c.Reply = &reply
+	saveCtx, stop := context.WithTimeout(context.Background(), time.Second)
+	err = s.Store.Save(saveCtx, key, c)
+	stop()
+	if err != nil {
+		s.Log.Warn("redis write failed after generation", "error", err)
+		s.release(key, token)
+		done <- newReply("Не удалось сохранить ответ. Повторите вопрос.", false, state)
+		return
+	}
+	s.release(key, token)
+	done <- reply
+}
+
+func (s *Server) ackInitial(ctx context.Context, key, token string, messageID int) {
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		locked, err := s.Store.Acquire(ctx, key, token)
+		if err != nil {
+			s.Log.Warn("redis lock failed")
+			return
+		}
+		if locked {
+			c, err := s.Store.Load(ctx, key)
+			if err == nil && c.LastID == messageID && c.Pending != nil && c.Pending.Done {
+				c.Pending = nil
+				err = s.Store.Save(ctx, key, c)
+			}
+			if err != nil {
+				s.Log.Warn("redis write failed")
+			}
+			s.release(key, token)
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *Server) awaitPending(ctx context.Context, key, token string, messageID int, state map[string]json.RawMessage) Reply {
+	waitCtx, cancel := context.WithTimeout(ctx, s.Config.GPTTimeout)
+	defer cancel()
+	ticker := time.NewTicker(80 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		c, err := s.Store.Load(waitCtx, key)
+		if err != nil {
+			s.Log.Warn("redis read failed")
+			return newReply("Не удалось прочитать ответ. Повторите позже.", false, state)
+		}
+		if c.Reply != nil && c.LastID == messageID {
+			return *c.Reply
+		}
+		if c.Pending == nil {
+			return newReply("Всё ещё думаю... скажи продолжить", false, state)
+		}
+		if c.Pending.Done {
+			locked, err := s.Store.Acquire(waitCtx, key, token)
+			if err != nil {
+				s.Log.Warn("redis lock failed")
+				return newReply("Сервис временно недоступен. Попробуйте позже.", false, state)
+			}
+			if locked {
+				current, loadErr := s.Store.Load(waitCtx, key)
+				var reply Reply
+				switch {
+				case loadErr != nil:
+					reply = newReply("Не удалось прочитать ответ. Повторите позже.", false, state)
+				case current.Reply != nil && current.LastID == messageID:
+					reply = *current.Reply
+				case current.Pending != nil && current.Pending.Done:
+					reply = s.deliverPending(waitCtx, key, current, messageID, state)
+				default:
+					reply = newReply("Ответ уже получен. Задайте вопрос.", false, state)
+				}
+				s.release(key, token)
+				return reply
+			}
+		}
+		if time.Since(c.Pending.StartedAt) > pendingLockTTL {
+			return newReply("Ответ не получен. Повторите вопрос.", false, state)
+		}
+		select {
+		case <-waitCtx.Done():
+			return newReply("Всё ещё думаю... скажи продолжить", false, state)
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *Server) deliverPending(ctx context.Context, key string, c Conversation, messageID int, state map[string]json.RawMessage) Reply {
+	state = cloneState(state)
+	state["turns"], _ = json.Marshal(c.Turns)
+	state["last_message_id"], _ = json.Marshal(messageID)
+	reply := newReply(c.Pending.Answer, false, state)
+	c.Pending = nil
+	c.LastID = messageID
+	c.Reply = &reply
+	if err := s.Store.Save(ctx, key, c); err != nil {
+		s.Log.Warn("redis write failed")
+		return newReply("Не удалось сохранить ответ. Повторите вопрос.", false, state)
+	}
+	return reply
+}
+
+func cloneState(state map[string]json.RawMessage) map[string]json.RawMessage {
+	copy := make(map[string]json.RawMessage, len(state))
+	for key, value := range state {
+		copy[key] = value
+	}
+	return copy
+}
+
 func newReply(text string, end bool, state map[string]json.RawMessage) Reply {
 	r := Reply{Version: "1.0", SessionState: state}
 	r.Response.Text = text

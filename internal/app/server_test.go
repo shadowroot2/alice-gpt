@@ -62,10 +62,14 @@ func (m *memoryStore) Allow(context.Context, string, int) (bool, error) { return
 type generatorFunc func(context.Context, []Message) (string, error)
 
 func (f generatorFunc) Generate(c context.Context, m []Message) (string, error) { return f(c, m) }
-func fixture(g Generator) (http.Handler, *memoryStore) {
+func fixtureServer(g Generator) (*Server, *memoryStore) {
 	m := &memoryStore{data: map[string]Conversation{}, locked: map[string]string{}}
-	c := Config{WebhookToken: strings.Repeat("x", 32), SkillID: "skill", GPTTimeout: 50 * time.Millisecond, HistoryTurns: 2, MaxAnswerChars: 100, RequestsPerMinute: 20, MaxConcurrent: 2}
-	return NewServer(c, m, g, slog.New(slog.NewTextHandler(io.Discard, nil))).Handler(), m
+	c := Config{WebhookToken: strings.Repeat("x", 32), SkillID: "skill", GPTTimeout: 50 * time.Millisecond, GPTBackgroundTimeout: 200 * time.Millisecond, HistoryTurns: 2, MaxAnswerChars: 100, RequestsPerMinute: 20, MaxConcurrent: 2}
+	return NewServer(c, m, g, slog.New(slog.NewTextHandler(io.Discard, nil))), m
+}
+func fixture(g Generator) (http.Handler, *memoryStore) {
+	s, m := fixtureServer(g)
+	return s.Handler(), m
 }
 func call(t *testing.T, h http.Handler, id int, text, session string) Reply {
 	t.Helper()
@@ -128,15 +132,107 @@ func TestResetAndExit(t *testing.T) {
 		t.Fatal("exit failed")
 	}
 }
-func TestTimeoutDoesNotSave(t *testing.T) {
-	h, m := fixture(generatorFunc(func(ctx context.Context, _ []Message) (string, error) { <-ctx.Done(); return "", ctx.Err() }))
+func TestBackgroundTimeoutDoesNotSaveAnswer(t *testing.T) {
+	s, m := fixtureServer(generatorFunc(func(ctx context.Context, _ []Message) (string, error) { <-ctx.Done(); return "", ctx.Err() }))
+	h := s.Handler()
 	start := time.Now()
 	r := call(t, h, 0, "вопрос", "s")
-	if !strings.Contains(r.Response.Text, "Повторите") || time.Since(start) > time.Second {
-		t.Fatal("timeout fallback failed")
+	if !strings.Contains(r.Response.Text, "Думаю") || time.Since(start) > time.Second {
+		t.Fatal("thinking response missing")
 	}
-	if len(m.data) != 0 {
-		t.Fatal("failed response polluted history")
+	r = call(t, h, 1, "продолжить", "s")
+	if !strings.Contains(r.Response.Text, "думаю") {
+		t.Fatalf("expected continued waiting: %q", r.Response.Text)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := s.Wait(ctx); err != nil {
+		t.Fatal(err)
+	}
+	r = call(t, h, 2, "продолжить", "s")
+	if !strings.Contains(r.Response.Text, "Не удалось") {
+		t.Fatalf("expected final failure: %q", r.Response.Text)
+	}
+	for _, c := range m.data {
+		if len(c.Messages) != 0 || c.Pending != nil {
+			t.Fatal("failed response polluted history")
+		}
+	}
+}
+
+func TestContinueReturnsBackgroundAnswer(t *testing.T) {
+	release := make(chan struct{})
+	var mu sync.Mutex
+	var inputs [][]Message
+	s, m := fixtureServer(generatorFunc(func(_ context.Context, messages []Message) (string, error) {
+		mu.Lock()
+		inputs = append(inputs, append([]Message{}, messages...))
+		mu.Unlock()
+		if len(messages) == 1 {
+			<-release
+		}
+		return "Готовый ответ.", nil
+	}))
+	s.Config.GPTBackgroundTimeout = 2 * time.Second
+	h := s.Handler()
+	first := call(t, h, 0, "Первый вопрос", "s")
+	if first.Response.Text != "Думаю... чтобы продолжить скажи продолжить" || first.Response.EndSession {
+		t.Fatalf("bad initial response: %+v", first.Response)
+	}
+	if again := call(t, h, 0, "Первый вопрос", "s"); again.Response.Text != first.Response.Text {
+		t.Fatal("duplicate question changed while pending")
+	}
+	if waiting := call(t, h, 1, "продолжить", "s"); !strings.Contains(waiting.Response.Text, "ещё думаю") {
+		t.Fatalf("bad waiting response: %q", waiting.Response.Text)
+	}
+	close(release)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := s.Wait(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ready := call(t, h, 2, "продолжить", "s")
+	if ready.Response.Text != "Готовый ответ." || string(ready.SessionState["turns"]) != "1" {
+		t.Fatalf("cached answer missing: %+v", ready)
+	}
+	if again := call(t, h, 2, "продолжить", "s"); again.Response.Text != ready.Response.Text {
+		t.Fatal("duplicate continuation changed")
+	}
+	continued := call(t, h, 3, "продолжить", "s")
+	if continued.Response.Text != "Готовый ответ." {
+		t.Fatalf("model did not handle continuation: %q", continued.Response.Text)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(inputs) != 2 || len(inputs[1]) != 3 || inputs[1][0].Content != "Первый вопрос" || inputs[1][1].Content != "Готовый ответ." || inputs[1][2].Content != "продолжить" {
+		t.Fatalf("history missing after continuation: %+v", inputs)
+	}
+	for _, c := range m.data {
+		if c.Pending != nil {
+			t.Fatal("pending answer not cleared")
+		}
+	}
+}
+func TestContinueAfterImmediateAnswerGoesToModel(t *testing.T) {
+	var mu sync.Mutex
+	var inputs [][]Message
+	s, _ := fixtureServer(generatorFunc(func(_ context.Context, messages []Message) (string, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		inputs = append(inputs, append([]Message{}, messages...))
+		return "Ответ", nil
+	}))
+	h := s.Handler()
+	if r := call(t, h, 0, "Вопрос", "s"); r.Response.Text != "Ответ" {
+		t.Fatalf("answer was not immediate: %q", r.Response.Text)
+	}
+	if r := call(t, h, 1, "продолжить", "s"); r.Response.Text != "Ответ" {
+		t.Fatalf("continuation was not sent to model: %q", r.Response.Text)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(inputs) != 2 || len(inputs[1]) != 3 || inputs[1][0].Content != "Вопрос" || inputs[1][1].Content != "Ответ" || inputs[1][2].Content != "продолжить" {
+		t.Fatalf("wrong continuation history: %+v", inputs)
 	}
 }
 func TestGenerationFailureDoesNotClaimTimeout(t *testing.T) {
@@ -147,8 +243,10 @@ func TestGenerationFailureDoesNotClaimTimeout(t *testing.T) {
 	if r.Response.Text != "Не удалось получить ответ. Повторите вопрос." {
 		t.Fatalf("unexpected response: %q", r.Response.Text)
 	}
-	if len(m.data) != 0 {
-		t.Fatal("failed response polluted history")
+	for _, c := range m.data {
+		if len(c.Messages) != 0 || c.Pending != nil {
+			t.Fatal("failed response polluted history")
+		}
 	}
 }
 func TestStoreUnavailable(t *testing.T) {
@@ -181,7 +279,7 @@ func TestConcurrentSession(t *testing.T) {
 	go func() { defer close(done); call(t, h, 0, "первый", "s") }()
 	<-entered
 	r := call(t, h, 1, "второй", "s")
-	if !strings.Contains(r.Response.Text, "обрабатывается") {
+	if !strings.Contains(r.Response.Text, "думаю") {
 		t.Fatal("concurrent request not blocked")
 	}
 	close(release)

@@ -9,7 +9,7 @@ import (
 
 type Config struct {
 	APIKey, Model, RedisURL, SkillID, WebhookToken, Listen         string
-	GPTTimeout, SessionTTL                                         time.Duration
+	GPTTimeout, GPTBackgroundTimeout, SessionTTL                   time.Duration
 	HistoryTurns, MaxAnswerChars, RequestsPerMinute, MaxConcurrent int
 }
 
@@ -21,6 +21,9 @@ func LoadConfig() (Config, error) {
 	var err error
 	if c.GPTTimeout, err = time.ParseDuration(env("GPT_TIMEOUT", "3s")); err != nil || c.GPTTimeout < 100*time.Millisecond || c.GPTTimeout > 3200*time.Millisecond {
 		return c, fmt.Errorf("GPT_TIMEOUT must be between 100ms and 3.2s")
+	}
+	if c.GPTBackgroundTimeout, err = time.ParseDuration(env("GPT_BACKGROUND_TIMEOUT", "25s")); err != nil || c.GPTBackgroundTimeout < 5*time.Second || c.GPTBackgroundTimeout > 30*time.Second {
+		return c, fmt.Errorf("GPT_BACKGROUND_TIMEOUT must be between 5s and 30s")
 	}
 	if c.SessionTTL, err = time.ParseDuration(env("SESSION_TTL", "30m")); err != nil || c.SessionTTL < time.Minute || c.SessionTTL > 24*time.Hour {
 		return c, fmt.Errorf("SESSION_TTL must be between 1m and 24h")

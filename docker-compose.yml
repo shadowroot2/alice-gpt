@@ -14,7 +14,7 @@ services:
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     mem_limit: 192m
-    stop_grace_period: 10s
+    stop_grace_period: 40s
     healthcheck:
       test: [CMD, /usr/local/bin/server, healthcheck]
       interval: 30s
